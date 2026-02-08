@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-// import { GoogleGenerativeAI } from "@google/generative-ai";
-//
-import { GoogleGenAI, MediaResolution, ThinkingLevel } from "@google/genai";
-// Initialize Gemini AI
-const genAI = new GoogleGenAI({});
+import {
+  GoogleGenAI,
+  MediaResolution,
+  ThinkingLevel,
+  createUserContent,
+  createPartFromUri,
+} from "@google/genai";
 
-// Define the structured output schema for Gemini responses
+const genAI = new GoogleGenAI({ apiVersion: "v1alpha" });
+
 const responseSchema = {
   type: "object",
   properties: {
@@ -25,8 +28,7 @@ const responseSchema = {
     },
     shouldRespond: {
       type: "boolean",
-      description:
-        "Whether this response should be spoken to the user via TTS. Set to false if the scene hasn't changed significantly or if there's nothing important to report.",
+      description: "Whether this response should be spoken to the user via TTS",
     },
     transcription: {
       type: "string",
@@ -37,7 +39,6 @@ const responseSchema = {
 };
 
 export async function POST(request: NextRequest) {
-  console.log(process.env.GEMINI_API_KEY);
   try {
     const formData = await request.formData();
     const videoFile = formData.get("video") as File | null;
@@ -45,25 +46,24 @@ export async function POST(request: NextRequest) {
     const userIntent = formData.get("intent") as string | null;
     const currentMode = formData.get("currentMode") as string | null;
 
-    // Convert files to base64 if they exist
-    let videoBase64: string | null = null;
-    let audioBase64: string | null = null;
+    console.log("📥 Received request:", {
+      hasVideo: !!videoFile,
+      hasAudio: !!audioFile,
+      videoSize: videoFile?.size,
+      audioSize: audioFile?.size,
+      intent: userIntent,
+      mode: currentMode,
+    });
 
-    if (videoFile && videoFile.size > 0) {
-      const videoBuffer = await videoFile.arrayBuffer();
-      videoBase64 = Buffer.from(videoBuffer).toString("base64");
+    if (!videoFile && !audioFile) {
+      return NextResponse.json(
+        { success: false, error: "No video or audio data provided" },
+        { status: 400 },
+      );
     }
 
-    if (audioFile && audioFile.size > 0) {
-      const audioBuffer = await audioFile.arrayBuffer();
-      audioBase64 = Buffer.from(audioBuffer).toString("base64");
-    }
+    const systemPrompt = `You are an AI assistant for visually impaired users. Analyze the provided video and audio content.
 
-    // Build the prompt based on user intent and current mode
-    let systemPrompt = `You are an AI assistant for visually impaired users. Analyze the provided video and audio content. however not everytime you have to give the description of scene only when the user asks,
-
-            also you will be answering any question user asks.
-    
 Current mode: ${currentMode || "idle"}
 User intent: ${userIntent || "general awareness"}
 
@@ -73,7 +73,7 @@ CRITICAL: Respond with a JSON object matching this schema:
   "mode": "idle|continuous|single", 
   "reason": "Brief explanation of mode choice",
   "shouldRespond": true|false,
-  "transcription":"Audio transcription of what user said"
+  "transcription": "Audio transcription of what user said"
 }
 
 MODES:
@@ -89,79 +89,170 @@ SHOULD RESPOND RULES:
   * User is in continuous mode and needs navigation guidance
   
 - Set "shouldRespond" to FALSE when:
-  * If there is noise or no question asked
-  * Scene hasn't changed significantly from last analysis
+  * Background noise or no clear question
+  * Scene hasn't changed significantly
   * Nothing important to report
   * User is in idle mode and no questions were asked
-  * Repetitive information that was already mentioned
 
 RESPONSE RULES:
 1. Prioritize safety - identify obstacles, moving objects, stairs
 2. Give clear directional guidance: left, right, forward, stop
 3. Be extremely concise - maximum 2 short sentences
-4. Never explain your reasoning in the analysis`;
+4. First transcribe what the user said, then analyze the scene
+5. If no clear speech detected, set transcription to empty string`;
 
-    const parts: any[] = [{ text: systemPrompt }];
+    // Upload files in parallel to File API
+    console.log("📤 Uploading files to Gemini File API...");
+    const uploadStartTime = Date.now();
 
-    if (videoBase64) {
-      parts.push({
-        inlineData: {
-          mimeType: "video/webm",
-          data: videoBase64,
-        },
-      });
+    const uploadPromises: Promise<any>[] = [];
+
+    if (videoFile && videoFile.size > 0) {
+      uploadPromises.push(
+        genAI.files
+          .upload({
+            file: videoFile,
+            config: { mimeType: "video/webm" },
+          })
+          .then((file) => {
+            console.log(
+              `✅ Video uploaded: ${file.uri} (${((Date.now() - uploadStartTime) / 1000).toFixed(2)}s)`,
+            );
+            return { type: "video", file };
+          }),
+      );
     }
 
-    if (audioBase64) {
-      parts.push({
-        inlineData: {
-          mimeType: "audio/mp3",
-          data: audioBase64,
-        },
-      });
+    if (audioFile && audioFile.size > 0) {
+      uploadPromises.push(
+        genAI.files
+          .upload({
+            file: audioFile,
+            config: { mimeType: "audio/webm" },
+          })
+          .then((file) => {
+            console.log(
+              `✅ Audio uploaded: ${file.uri} (${((Date.now() - uploadStartTime) / 1000).toFixed(2)}s)`,
+            );
+            return { type: "audio", file };
+          }),
+      );
     }
 
-    // console.log(parts);
-    console.log(videoFile?.size);
-    console.log(audioFile?.size);
+    if (uploadPromises.length === 0) {
+      return NextResponse.json(
+        { success: false, error: "No valid media files" },
+        { status: 400 },
+      );
+    }
 
-    // const model = genAI.getGenerativeModel({
-    //   model: "gemini-3-flash-preview",
-    //   generationConfig: {
-    //     responseMimeType: "application/json",
-    //     responseSchema: responseSchema,
-    //   },
-    // });
+    // Wait for all uploads to complete in parallel
+    const uploadedFiles = await Promise.all(uploadPromises);
+    console.log(
+      `✅ All files uploaded in ${((Date.now() - uploadStartTime) / 1000).toFixed(2)}s`,
+    );
 
-    const result = await genAI.models.generateContent({
-      contents: [{ parts }],
-      model: "gemini-3-flash-preview",
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: responseSchema,
-        thinkingConfig: {
-          thinkingLevel: ThinkingLevel.LOW,
+    // Build content parts with uploaded file URIs
+    const contentParts: any[] = [];
+
+    for (const { file } of uploadedFiles) {
+      var looping = true;
+      console.log(file);
+      while (looping) {
+        console.log(file.state);
+        switch (file.state) {
+          case "ACTIVE":
+            looping = true;
+            break;
+
+          case "FAILED":
+            throw new Error(`Failed to upload ${file}`);
+        }
+      }
+
+      console.log(file.state);
+      contentParts.push(createPartFromUri(file.uri, file.mimeType));
+    }
+
+    contentParts.push(systemPrompt);
+
+    // Generate content using uploaded files
+    let result;
+    try {
+      console.log("🤖 Generating content with Gemini...");
+      const generateStartTime = Date.now();
+
+      result = await genAI.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: createUserContent(contentParts),
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: responseSchema,
+          mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
+          thinkingConfig: {
+            thinkingLevel: ThinkingLevel.MINIMAL,
+          },
         },
-        mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
-      },
-    });
+      });
+
+      console.log(
+        `✅ Content generated in ${((Date.now() - generateStartTime) / 1000).toFixed(2)}s`,
+      );
+    } catch (apiError: any) {
+      console.error("❌ Gemini API error:", apiError);
+
+      let errorMessage = "Gemini API error";
+      if (apiError.message?.includes("INVALID_ARGUMENT")) {
+        errorMessage =
+          "Invalid media format - please check video/audio encoding";
+      } else if (apiError.message?.includes("QUOTA_EXCEEDED")) {
+        errorMessage = "API quota exceeded - please try again later";
+      } else if (apiError.message) {
+        errorMessage = apiError.message;
+      }
+
+      return NextResponse.json(
+        {
+          success: false,
+          error: errorMessage,
+          details: apiError.message || "Unknown API error",
+        },
+        { status: 500 },
+      );
+    } finally {
+      // Clean up uploaded files (optional - files auto-delete after 48 hours)
+      try {
+        await Promise.all(
+          uploadedFiles.map(({ file }) => genAI.files.delete(file.name)),
+        );
+        console.log("🗑️ Uploaded files cleaned up");
+      } catch (cleanupError) {
+        console.warn("⚠️ File cleanup failed (non-critical):", cleanupError);
+      }
+    }
 
     const responseText = result.text;
-    console.log(responseText);
+    console.log("📨 Gemini response:", responseText);
 
     // Parse the structured JSON response
     let parsedResponse;
     try {
-      parsedResponse = JSON.parse(responseText || "");
-      console.log(parsedResponse);
-    } catch (e) {
-      console.error("Failed to parse structured response:", responseText);
-      // Fallback to manual parsing if structured output fails
+      parsedResponse = JSON.parse(responseText || "{}");
+
+      if (!parsedResponse.analysis || !parsedResponse.mode) {
+        throw new Error("Missing required fields in response");
+      }
+
+      console.log("✅ Response parsed successfully");
+    } catch (parseError) {
+      console.error("❌ Failed to parse response:", parseError);
+
       parsedResponse = {
-        analysis: responseText.replace(/["{}]/g, "").substring(0, 200),
+        analysis: responseText?.substring(0, 200) || "Unable to analyze",
         mode: "single",
         reason: "Fallback due to parse error",
-        shouldRespond: true, // Default to responding on error
+        shouldRespond: true,
+        transcription: "",
       };
     }
 
@@ -170,7 +261,7 @@ RESPONSE RULES:
       data: parsedResponse,
     });
   } catch (error) {
-    console.error("Gemini API error:", error);
+    console.error("❌ Server error:", error);
     return NextResponse.json(
       {
         success: false,
@@ -182,10 +273,11 @@ RESPONSE RULES:
   }
 }
 
-// Handle health check
 export async function GET() {
   return NextResponse.json({
     status: "healthy",
     timestamp: new Date().toISOString(),
+    model: "gemini-3-flash-preview",
+    method: "File API (parallel upload)",
   });
 }
