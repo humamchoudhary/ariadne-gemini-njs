@@ -27,7 +27,7 @@ interface GeminiResponse {
   reason: string;
   shouldRespond: boolean;
   transcription?: string;
-  speak?: string;
+  speak: string;
 }
 
 export default function ImprovedIntelligentAnalyzer() {
@@ -410,7 +410,6 @@ export default function ImprovedIntelligentAnalyzer() {
 
         if (result.success && result.data) {
           const geminiResponse: GeminiResponse = result.data;
-          setCurrentAnalysis(geminiResponse.analysis);
           setCurrentMode(geminiResponse.mode);
           setLastTranscription(geminiResponse.transcription || "");
 
@@ -444,9 +443,7 @@ export default function ImprovedIntelligentAnalyzer() {
         const isRetryableError =
           errorMessage.includes("Invalid_field") ||
           errorMessage.includes("timeout") ||
-          errorMessage.includes("network") ||
-          response.status >= 500;
-
+          errorMessage.includes("network");
         if (isRetryableError && retryCount < 3) {
           setRetryCount((prev) => prev + 1);
           console.log(`🔄 Retrying... Attempt ${retryCount + 1}/3`);
