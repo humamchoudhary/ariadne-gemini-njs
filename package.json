@@ -10,8 +10,11 @@
     "format": "biome format --write"
   },
   "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.6",
     "@google/genai": "^1.40.0",
     "lucide-react": "^0.563.0",
+    "music-metadata-browser": "^2.5.11",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3"

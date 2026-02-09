@@ -58,17 +58,23 @@ export default function ImprovedIntelligentAnalyzer() {
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [speechConfidence, setSpeechConfidence] = useState(0);
   const [lastTranscription, setLastTranscription] = useState<string>("");
+  const [isInitializing, setIsInitializing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderVideoRef = useRef<MediaRecorder | null>(null);
   const mediaRecorderAudioRef = useRef<MediaRecorder | null>(null);
-  const videoChunksRef = useRef<{ blob: Blob; timestamp: number }[]>([]);
-  const audioChunksRef = useRef<{ blob: Blob; timestamp: number }[]>([]);
+  const videoChunksRef = useRef<
+    { data: ArrayBuffer; timestamp: number; mimeType: string }[]
+  >([]);
+  const audioChunksRef = useRef<
+    { data: ArrayBuffer; timestamp: number; mimeType: string }[]
+  >([]);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const vadRef = useRef<VoiceActivityDetector | null>(null);
   const speechEndTimerRef = useRef<NodeJS.Timeout | null>(null);
   const continuousModeRef = useRef(false);
+  const isSpeechEndingRef = useRef(false);
 
   const currentModeRef = useRef<AnalysisMode>(currentMode);
   const isProcessingRef = useRef(isProcessing);
@@ -94,6 +100,35 @@ export default function ImprovedIntelligentAnalyzer() {
     );
   }, []);
 
+  // Stop all media recorders properly
+  const stopAllMediaRecorders = useCallback(async () => {
+    console.log("🛑 Stopping all media recorders...");
+
+    // Stop video recorder
+    if (mediaRecorderVideoRef.current) {
+      if (mediaRecorderVideoRef.current.state === "recording") {
+        mediaRecorderVideoRef.current.stop();
+      }
+      mediaRecorderVideoRef.current = null;
+    }
+
+    // Stop audio recorder
+    if (mediaRecorderAudioRef.current) {
+      if (mediaRecorderAudioRef.current.state === "recording") {
+        mediaRecorderAudioRef.current.stop();
+      }
+      mediaRecorderAudioRef.current = null;
+    }
+
+    // Clear chunks
+    videoChunksRef.current = [];
+    audioChunksRef.current = [];
+
+    // Reset chunk arrays
+    videoChunksRef.current = [];
+    audioChunksRef.current = [];
+  }, []);
+
   // Send data to Gemini API
   const analyzeWithGemini = async (
     intent?: string,
@@ -102,100 +137,126 @@ export default function ImprovedIntelligentAnalyzer() {
       setIsProcessing(true);
       const startTime = Date.now();
 
-      cleanOldChunks();
+      // Create blobs from all available chunks
+      let videoBlob: Blob | null = null;
+      let audioBlob: Blob | null = null;
 
-      console.log(
-        `📊 Sending last ${CAPTURE_WINDOW_SECONDS}s: ${videoChunksRef.current.length} video chunks, ${audioChunksRef.current.length} audio chunks`,
-      );
-
-      const formData = new FormData();
-
-      // Add video
       if (videoChunksRef.current.length > 0) {
-        const videoBlobs = videoChunksRef.current.map((chunk) => chunk.blob);
-        const videoBlob = new Blob(videoBlobs, {
+        const videoDataArray = videoChunksRef.current.map(
+          (chunk) => new Uint8Array(chunk.data),
+        );
+        const totalVideoSize = videoDataArray.reduce(
+          (sum, arr) => sum + arr.length,
+          0,
+        );
+        const combinedVideoArray = new Uint8Array(totalVideoSize);
+
+        let offset = 0;
+        videoDataArray.forEach((arr) => {
+          combinedVideoArray.set(arr, offset);
+          offset += arr.length;
+        });
+
+        videoBlob = new Blob([combinedVideoArray], {
           type: "video/webm;codecs=vp8",
         });
-        formData.append("video", videoBlob, "video.webm");
         console.log(`📹 Video size: ${(videoBlob.size / 1024).toFixed(2)} KB`);
       }
 
-      // Add audio
       if (audioChunksRef.current.length > 0) {
-        const audioBlobs = audioChunksRef.current.map((chunk) => chunk.blob);
-        const audioBlob = new Blob(audioBlobs, {
+        const audioDataArray = audioChunksRef.current.map(
+          (chunk) => new Uint8Array(chunk.data),
+        );
+        const totalAudioSize = audioDataArray.reduce(
+          (sum, arr) => sum + arr.length,
+          0,
+        );
+        const combinedAudioArray = new Uint8Array(totalAudioSize);
+
+        let offset = 0;
+        audioDataArray.forEach((arr) => {
+          combinedAudioArray.set(arr, offset);
+          offset += arr.length;
+        });
+
+        audioBlob = new Blob([combinedAudioArray], {
           type: "audio/webm;codecs=opus",
         });
-        formData.append("audio", audioBlob, "audio.webm");
         console.log(`🎤 Audio size: ${(audioBlob.size / 1024).toFixed(2)} KB`);
       }
 
-      const dataSize =
-        videoChunksRef.current.reduce(
-          (sum, chunk) => sum + chunk.blob.size,
-          0,
-        ) +
-        audioChunksRef.current.reduce((sum, chunk) => sum + chunk.blob.size, 0);
+      // Stop recorders before sending to avoid conflicts
+      await stopAllMediaRecorders();
+
+      const formData = new FormData();
+
+      if (videoBlob && videoBlob.size > 0) {
+        formData.append("video", videoBlob, "video.webm");
+      }
+
+      if (audioBlob && audioBlob.size > 0) {
+        formData.append("audio", audioBlob, "audio.webm");
+      }
 
       formData.append("intent", intent || "general awareness");
       formData.append("currentMode", currentModeRef.current);
 
-      // Call API
       const response = await fetch("/api/gemini", {
         method: "POST",
         body: formData,
       });
 
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
       const result = await response.json();
 
-      if (!result.success) {
-        console.error("❌ API error:", result.error);
-        throw new Error(result.error || "Analysis failed");
-      }
+      if (result.success && result.data) {
+        const geminiResponse: GeminiResponse = result.data;
+        setCurrentAnalysis(geminiResponse.analysis);
+        setCurrentMode(geminiResponse.mode);
+        setLastTranscription(geminiResponse.transcription || "");
 
-      const geminiResponse: GeminiResponse = result.data;
+        // Add to recordings history
+        const newRecording: Recording = {
+          timestamp: new Date().toLocaleTimeString(),
+          size: (videoBlob?.size || 0) + (audioBlob?.size || 0),
+          analysis: geminiResponse.analysis,
+          processingTime: Date.now() - startTime,
+          transcription: geminiResponse.transcription,
+        };
 
-      // Update state
-      setCurrentMode(geminiResponse.mode);
-      setCurrentAnalysis(geminiResponse.analysis);
+        setRecordings((prev) => [newRecording, ...prev.slice(0, 9)]);
 
-      if (geminiResponse.transcription) {
-        setLastTranscription(geminiResponse.transcription);
-      }
+        // Speak if needed
+        if (geminiResponse.shouldRespond) {
+          speakText(geminiResponse.analysis);
+        }
 
-      // Add to history
-      const newRecording: Recording = {
-        timestamp: new Date().toLocaleTimeString("en-US", {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        }),
-        size: dataSize,
-        analysis: geminiResponse.analysis,
-        transcription: geminiResponse.transcription,
-        processingTime: Date.now() - startTime,
-      };
+        // Restart recording if in continuous mode or idle
+        if (
+          geminiResponse.mode === "continuous" ||
+          geminiResponse.mode === "idle"
+        ) {
+          setTimeout(() => {
+            if (streamRef.current) {
+              startRecordingInternal(streamRef.current);
+            }
+          }, 1000); // Wait 1 second before restarting
+        }
 
-      setRecordings((prev) => [newRecording, ...prev.slice(0, 9)]);
-
-      // Speak if needed
-      if (geminiResponse.shouldRespond) {
-        console.log("🔊 Speaking response to user");
-        speakText(geminiResponse.analysis);
+        return geminiResponse;
       } else {
-        console.log("🔇 Skipping TTS - no significant changes");
+        throw new Error(result.error || "Unknown error");
       }
-
-      console.log(`✅ Analysis: ${geminiResponse.analysis}`);
-      console.log(`Mode: ${geminiResponse.mode} (${geminiResponse.reason})`);
-
-      return geminiResponse;
     } catch (error) {
       console.error("❌ Analysis error:", error);
       setCurrentAnalysis("Error analyzing content. Please try again.");
       return null;
     } finally {
       setIsProcessing(false);
+      isSpeechEndingRef.current = false;
     }
   };
 
@@ -206,6 +267,7 @@ export default function ImprovedIntelligentAnalyzer() {
         console.log("🎙️ Speech started");
         setIsUserSpeaking(true);
         setSpeechConfidence(event.confidence);
+        isSpeechEndingRef.current = false;
 
         // Clear any pending speech end timer
         if (speechEndTimerRef.current) {
@@ -218,6 +280,13 @@ export default function ImprovedIntelligentAnalyzer() {
         console.log(`🎙️ Speech ended (duration: ${event.duration}ms)`);
         setIsUserSpeaking(false);
         setSpeechConfidence(0);
+
+        // Prevent multiple speech end events
+        if (isSpeechEndingRef.current) {
+          return;
+        }
+
+        isSpeechEndingRef.current = true;
 
         // Wait a moment before analyzing to catch any final audio
         speechEndTimerRef.current = setTimeout(async () => {
@@ -235,7 +304,7 @@ export default function ImprovedIntelligentAnalyzer() {
             await analyzeWithGemini("user question");
           }
           speechEndTimerRef.current = null;
-        }, 500);
+        }, 800); // Increased from 500ms to 800ms for better audio capture
       }
     },
     [analyzeWithGemini],
@@ -321,6 +390,7 @@ export default function ImprovedIntelligentAnalyzer() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (speechEndTimerRef.current) clearTimeout(speechEndTimerRef.current);
+      stopAllMediaRecorders();
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
       }
@@ -331,7 +401,7 @@ export default function ImprovedIntelligentAnalyzer() {
         window.speechSynthesis.cancel();
       }
     };
-  }, []);
+  }, [stopAllMediaRecorders]);
 
   const setupVideo = async (stream: MediaStream) => {
     if (!videoRef.current) return;
@@ -348,6 +418,7 @@ export default function ImprovedIntelligentAnalyzer() {
 
   const requestPermissions = async () => {
     try {
+      setIsInitializing(true);
       setPermissionError(null);
 
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -378,11 +449,13 @@ export default function ImprovedIntelligentAnalyzer() {
 
       setHasPermissions(true);
       await startRecordingInternal(stream);
+      setIsInitializing(false);
 
       return true;
     } catch (error: any) {
       console.error("Permission error:", error);
       setPermissionError("Failed to get camera/microphone permissions");
+      setIsInitializing(false);
       return false;
     }
   };
@@ -397,47 +470,89 @@ export default function ImprovedIntelligentAnalyzer() {
 
     console.log("=== Starting Recording with VAD ===");
 
+    // Ensure no existing recorders are running
+    await stopAllMediaRecorders();
+
+    // Clear existing chunks
     videoChunksRef.current = [];
     audioChunksRef.current = [];
 
+    // Get fresh tracks from stream
+    const videoTrack = activeStream.getVideoTracks()[0];
+    const audioTrack = activeStream.getAudioTracks()[0];
+
+    if (!videoTrack || !audioTrack) {
+      console.error("Missing video or audio track");
+      return;
+    }
+
+    // Create fresh streams for each recorder
+    const videoStream = new MediaStream([videoTrack]);
+    const audioStream = new MediaStream([audioTrack]);
+
     // VIDEO RECORDER
-    const videoStream = new MediaStream(activeStream.getVideoTracks());
-    mediaRecorderVideoRef.current = new MediaRecorder(videoStream, {
-      mimeType: "video/webm;codecs=vp8",
-      videoBitsPerSecond: 300000,
-    });
+    try {
+      mediaRecorderVideoRef.current = new MediaRecorder(videoStream, {
+        mimeType: "video/webm;codecs=vp8",
+        videoBitsPerSecond: 300000,
+      });
 
-    mediaRecorderVideoRef.current.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        videoChunksRef.current.push({
-          blob: event.data,
-          timestamp: Date.now(),
-        });
-      }
-    };
+      mediaRecorderVideoRef.current.ondataavailable = async (event) => {
+        if (event.data.size > 0) {
+          const arrayBuffer = await event.data.arrayBuffer();
+          videoChunksRef.current.push({
+            data: arrayBuffer,
+            timestamp: Date.now(),
+            mimeType: event.data.type,
+          });
 
-    mediaRecorderVideoRef.current.start(1000);
+          // Keep only recent chunks
+          const cutoffTime = Date.now() - CAPTURE_WINDOW_SECONDS * 1000;
+          videoChunksRef.current = videoChunksRef.current.filter(
+            (chunk) => chunk.timestamp > cutoffTime,
+          );
+        }
+      };
+
+      mediaRecorderVideoRef.current.start(1000); // Collect data every second
+    } catch (error) {
+      console.error("Failed to start video recorder:", error);
+      mediaRecorderVideoRef.current = null;
+    }
 
     // AUDIO RECORDER
-    const audioStream = new MediaStream(activeStream.getAudioTracks());
-    mediaRecorderAudioRef.current = new MediaRecorder(audioStream, {
-      mimeType: "audio/webm;codecs=opus",
-      audioBitsPerSecond: 32000,
-    });
+    try {
+      mediaRecorderAudioRef.current = new MediaRecorder(audioStream, {
+        mimeType: "audio/webm;codecs=opus",
+        audioBitsPerSecond: 32000,
+      });
 
-    mediaRecorderAudioRef.current.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        audioChunksRef.current.push({
-          blob: event.data,
-          timestamp: Date.now(),
-        });
-      }
-    };
+      mediaRecorderAudioRef.current.ondataavailable = async (event) => {
+        if (event.data.size > 0) {
+          const arrayBuffer = await event.data.arrayBuffer();
+          audioChunksRef.current.push({
+            data: arrayBuffer,
+            timestamp: Date.now(),
+            mimeType: event.data.type,
+          });
 
-    mediaRecorderAudioRef.current.start(1000);
+          // Keep only recent chunks
+          const cutoffTime = Date.now() - CAPTURE_WINDOW_SECONDS * 1000;
+          audioChunksRef.current = audioChunksRef.current.filter(
+            (chunk) => chunk.timestamp > cutoffTime,
+          );
+        }
+      };
+
+      mediaRecorderAudioRef.current.start(1000); // Collect data every second
+    } catch (error) {
+      console.error("Failed to start audio recorder:", error);
+      mediaRecorderAudioRef.current = null;
+    }
 
     setIsRecording(true);
     setRecordingTimer(0);
+    console.log("✅ Recording started successfully");
   };
 
   const stopRecording = async () => {
@@ -448,12 +563,8 @@ export default function ImprovedIntelligentAnalyzer() {
     if (timerRef.current) clearInterval(timerRef.current);
     if (speechEndTimerRef.current) clearTimeout(speechEndTimerRef.current);
 
-    if (mediaRecorderVideoRef.current?.state !== "inactive") {
-      mediaRecorderVideoRef.current?.stop();
-    }
-    if (mediaRecorderAudioRef.current?.state !== "inactive") {
-      mediaRecorderAudioRef.current?.stop();
-    }
+    // Stop and cleanup MediaRecorders
+    await stopAllMediaRecorders();
 
     continuousModeRef.current = false;
     setCurrentMode("idle");
@@ -578,6 +689,12 @@ export default function ImprovedIntelligentAnalyzer() {
                 Recording
               </span>
             )}
+            {isProcessing && (
+              <span className="ml-2 text-sm text-violet-400 flex items-center gap-2">
+                <div className="w-2 h-2 bg-violet-400 rounded-full animate-pulse" />
+                Processing
+              </span>
+            )}
           </div>
 
           <div className="relative aspect-video bg-black rounded-xl overflow-hidden">
@@ -614,9 +731,10 @@ export default function ImprovedIntelligentAnalyzer() {
                 )}
                 <button
                   onClick={requestPermissions}
-                  className="px-5 py-2.5 bg-violet-600 hover:bg-violet-700 rounded-xl font-semibold transition-colors"
+                  disabled={isInitializing}
+                  className="px-5 py-2.5 bg-violet-600 hover:bg-violet-700 rounded-xl font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Enable Camera & Mic
+                  {isInitializing ? "Initializing..." : "Enable Camera & Mic"}
                 </button>
               </div>
             )}
@@ -685,18 +803,21 @@ export default function ImprovedIntelligentAnalyzer() {
               onClick={() => {
                 if (!hasPermissions) {
                   requestPermissions();
+                } else if (streamRef.current) {
+                  startRecordingInternal(streamRef.current);
                 }
               }}
-              disabled={isProcessing}
+              disabled={isProcessing || isInitializing}
               className="flex-1 py-4 rounded-xl font-bold text-lg transition-all bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-700 hover:to-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3"
             >
               <Play className="w-6 h-6" />
-              START VOICE ASSISTANT
+              {isInitializing ? "INITIALIZING..." : "START VOICE ASSISTANT"}
             </button>
           ) : (
             <button
               onClick={stopRecording}
-              className="flex-1 py-4 rounded-xl font-bold text-lg bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 flex items-center justify-center gap-3"
+              disabled={isProcessing}
+              className="flex-1 py-4 rounded-xl font-bold text-lg bg-gradient-to-r from-red-600 to-red-700 hover:from-red-700 hover:to-red-800 flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Square className="w-6 h-6" />
               STOP ASSISTANT ({recordingTimer}s)
@@ -709,7 +830,8 @@ export default function ImprovedIntelligentAnalyzer() {
                 ? stopTTS
                 : () => speakText("Voice assistant is ready")
             }
-            className="px-5 py-2.5 border-2 border-violet-500 text-violet-500 rounded-xl font-semibold hover:bg-violet-500/10 transition-colors"
+            disabled={isProcessing}
+            className="px-5 py-2.5 border-2 border-violet-500 text-violet-500 rounded-xl font-semibold hover:bg-violet-500/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {ttsSpeaking ? "Stop TTS" : "Test TTS"}
           </button>
@@ -807,6 +929,22 @@ export default function ImprovedIntelligentAnalyzer() {
             </div>
           </div>
         </div>
+
+        {/* Debug Info (remove in production) */}
+        {process.env.NODE_ENV === "development" && (
+          <div className="bg-red-900/20 rounded-2xl p-4 border border-red-700/50">
+            <h4 className="font-semibold text-red-300 mb-2">Debug Info</h4>
+            <div className="text-xs text-red-200 space-y-1">
+              <div>Video chunks: {videoChunksRef.current.length}</div>
+              <div>Audio chunks: {audioChunksRef.current.length}</div>
+              <div>
+                Is speech ending: {isSpeechEndingRef.current ? "Yes" : "No"}
+              </div>
+              <div>Is processing: {isProcessingRef.current ? "Yes" : "No"}</div>
+              <div>Current mode: {currentModeRef.current}</div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

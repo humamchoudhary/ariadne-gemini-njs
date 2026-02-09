@@ -1,22 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  GoogleGenAI,
-  MediaResolution,
-  ThinkingLevel,
-  createUserContent,
-  createPartFromUri,
-} from "@google/genai";
+import { GoogleGenAI, ThinkingLevel, createUserContent } from "@google/genai";
 
-const genAI = new GoogleGenAI({ apiVersion: "v1alpha" });
+const genAI = new GoogleGenAI({});
 
 const responseSchema = {
   type: "object",
   properties: {
-    analysis: {
-      type: "string",
-      description:
-        "The analysis of the video/audio content for visually impaired user",
-    },
     mode: {
       type: "string",
       enum: ["idle", "continuous", "single"],
@@ -34,9 +23,20 @@ const responseSchema = {
       type: "string",
       description: "Audio transcription of what the user said",
     },
+    speak: {
+      type: "string",
+      description: "Audio transcription of what the user said",
+    },
   },
-  required: ["analysis", "mode", "shouldRespond", "transcription"],
+  required: ["mode", "shouldRespond", "transcription", "speak"],
 };
+
+// Helper function to convert File to base64
+async function fileToBase64(file: File): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  return buffer.toString("base64");
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -45,6 +45,8 @@ export async function POST(request: NextRequest) {
     const audioFile = formData.get("audio") as File | null;
     const userIntent = formData.get("intent") as string | null;
     const currentMode = formData.get("currentMode") as string | null;
+    console.log(videoFile);
+    console.log(audioFile);
 
     console.log("📥 Received request:", {
       hasVideo: !!videoFile,
@@ -62,121 +64,137 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const systemPrompt = `You are an AI assistant for visually impaired users. Analyze the provided video and audio content.
+    const systemPrompt = `
+You are a companion assistant for a visually impaired user.
+You are NOT a narrator.
+You are NOT a scene describer.
+You are a calm, helpful presence who assists the user in daily life.
+
+Vision and audio are tools you may use, but they are NEVER the goal.
+Your primary goal is to support the user’s intent, comfort, and safety — just like a human companion would.
 
 Current mode: ${currentMode || "idle"}
-User intent: ${userIntent || "general awareness"}
+User intent: ${userIntent || "unknown"}
 
-CRITICAL: Respond with a JSON object matching this schema:
+
+
+
+────────────────────────
+RESPONSE FORMAT (STRICT)
+────────────────────────
+You MUST respond with a JSON object matching this schema exactly:
 {
-  "analysis": "Your analysis here - be concise and actionable",
-  "mode": "idle|continuous|single", 
-  "reason": "Brief explanation of mode choice",
-  "shouldRespond": true|false,
-  "transcription": "Audio transcription of what user said"
+  "mode": "idle | continuous | single",
+  "reason": "Short explanation for the chosen mode",
+  "shouldRespond": true | false,
+  "transcription": "Exact transcription of user speech, or empty string if none",
+      "speak":"What message should be relayed to the user"
+
 }
 
-MODES:
-- "idle": User is not actively navigating or asking questions. Keep responses minimal.
-- "continuous": User is actively navigating (like "navigate me out"). Keep analyzing until they reach destination.  
-- "single": User asked a specific question (like "what's in front of me"). Answer and go back to idle.
+────────────────────────
+PRIMARY DECISION ORDER (VERY IMPORTANT)
+────────────────────────
+1. Is the user trying to interact socially or conversationally?
+2. Is the user expressing intent, confusion, or need?
+3. Is there an immediate safety risk?
+4. Would visual information meaningfully help right now?
 
-SHOULD RESPOND RULES:
-- Set "shouldRespond" to TRUE when:
-  * User explicitly asked a question
-  * There's a safety hazard (obstacles, stairs, moving objects)
-  * Significant change in the environment
-  * User is in continuous mode and needs navigation guidance
-  
-- Set "shouldRespond" to FALSE when:
-  * Background noise or no clear question
-  * Scene hasn't changed significantly
-  * Nothing important to report
-  * User is in idle mode and no questions were asked
+If vision does not clearly help the user’s intent, DO NOT mention it.
 
-RESPONSE RULES:
-1. Prioritize safety - identify obstacles, moving objects, stairs
-2. Give clear directional guidance: left, right, forward, stop
-3. Be extremely concise - maximum 2 short sentences
-4. First transcribe what the user said, then analyze the scene
-5. If no clear speech detected, set transcription to empty string`;
+────────────────────────
+SILENCE & FILTERING RULES
+────────────────────────
+- If the user did not speak → stay silent
+- If speech is unclear or gibberish → stay silent
+- If nothing useful can be added → stay silent
+- Silence is not failure; silence is correct behavior
 
-    // Upload files in parallel to File API
-    console.log("📤 Uploading files to Gemini File API...");
-    const uploadStartTime = Date.now();
+────────────────────────
+COMPANION BEHAVIOR (WHEN RESPONDING)
+────────────────────────
+- Respond like a trusted person standing next to the user
+- Acknowledge the user first, not the environment
+- Use vision only to support decisions or safety
+- Never volunteer scene descriptions
+- Never explain what you “see” unless asked or needed
 
-    const uploadPromises: Promise<any>[] = [];
+Examples of correct tone:
+- "Hi, I’m your assistant. How can I help you?"
+- "I’m here with you."
+- "Let me know if you want help navigating."
+- "For your safety, stop for a moment."
+
+────────────────────────
+MODE USAGE
+────────────────────────
+"idle":
+- Default
+- User is quiet or just interacting casually
+
+"single":
+- One-time question, conversation, or request
+
+"continuous":
+- User is actively navigating and relying on you
+
+Only use "continuous" if the user clearly expects ongoing help.
+
+────────────────────────
+VISION USAGE RULES
+────────────────────────
+- Vision is silent by default
+- Vision supports intent, not curiosity
+- Vision may interrupt ONLY for immediate danger
+
+────────────────────────
+REMEMBER (THIS IS CRITICAL):
+You are a companion first.
+You are not a narrator.
+You speak only when it helps the user.
+`;
+    // Build content parts with inline data
+    console.log("📦 Converting files to base64...");
+    const conversionStartTime = Date.now();
+
+    const contentParts: any[] = [];
 
     if (videoFile && videoFile.size > 0) {
-      uploadPromises.push(
-        genAI.files
-          .upload({
-            file: videoFile,
-            config: { mimeType: "video/webm" },
-          })
-          .then((file) => {
-            console.log(
-              `✅ Video uploaded: ${file.uri} (${((Date.now() - uploadStartTime) / 1000).toFixed(2)}s)`,
-            );
-            return { type: "video", file };
-          }),
+      console.log("🎥 Converting video to base64...");
+      const videoBase64 = await fileToBase64(videoFile);
+      contentParts.push({
+        inlineData: {
+          mimeType: videoFile.type || "video/webm",
+          data: videoBase64,
+        },
+      });
+      console.log(
+        `✅ Video converted (${(videoBase64.length / 1024 / 1024).toFixed(2)} MB)`,
       );
     }
 
     if (audioFile && audioFile.size > 0) {
-      uploadPromises.push(
-        genAI.files
-          .upload({
-            file: audioFile,
-            config: { mimeType: "audio/webm" },
-          })
-          .then((file) => {
-            console.log(
-              `✅ Audio uploaded: ${file.uri} (${((Date.now() - uploadStartTime) / 1000).toFixed(2)}s)`,
-            );
-            return { type: "audio", file };
-          }),
+      console.log("🎵 Converting audio to base64...");
+      const audioBase64 = await fileToBase64(audioFile);
+      contentParts.push({
+        inlineData: {
+          mimeType: audioFile.type || "audio/webm",
+          data: audioBase64,
+        },
+      });
+      console.log(
+        `✅ Audio converted (${(audioBase64.length / 1024 / 1024).toFixed(2)} MB)`,
       );
     }
 
-    if (uploadPromises.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "No valid media files" },
-        { status: 400 },
-      );
-    }
-
-    // Wait for all uploads to complete in parallel
-    const uploadedFiles = await Promise.all(uploadPromises);
     console.log(
-      `✅ All files uploaded in ${((Date.now() - uploadStartTime) / 1000).toFixed(2)}s`,
+      `✅ All files converted in ${((Date.now() - conversionStartTime) / 1000).toFixed(2)}s`,
     );
 
-    // Build content parts with uploaded file URIs
-    const contentParts: any[] = [];
+    contentParts.push({ text: systemPrompt });
+    console.log("📝 Content parts prepared:", contentParts.length);
 
-    for (const { file } of uploadedFiles) {
-      var looping = true;
-      console.log(file);
-      while (looping) {
-        console.log(file.state);
-        switch (file.state) {
-          case "ACTIVE":
-            looping = true;
-            break;
-
-          case "FAILED":
-            throw new Error(`Failed to upload ${file}`);
-        }
-      }
-
-      console.log(file.state);
-      contentParts.push(createPartFromUri(file.uri, file.mimeType));
-    }
-
-    contentParts.push(systemPrompt);
-
-    // Generate content using uploaded files
+    // Generate content using inline data
     let result;
     try {
       console.log("🤖 Generating content with Gemini...");
@@ -188,7 +206,6 @@ RESPONSE RULES:
         config: {
           responseMimeType: "application/json",
           responseSchema: responseSchema,
-          mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
           thinkingConfig: {
             thinkingLevel: ThinkingLevel.MINIMAL,
           },
@@ -207,6 +224,8 @@ RESPONSE RULES:
           "Invalid media format - please check video/audio encoding";
       } else if (apiError.message?.includes("QUOTA_EXCEEDED")) {
         errorMessage = "API quota exceeded - please try again later";
+      } else if (apiError.message?.includes("Request payload size exceeds")) {
+        errorMessage = "File size too large - please reduce video/audio length";
       } else if (apiError.message) {
         errorMessage = apiError.message;
       }
@@ -219,16 +238,6 @@ RESPONSE RULES:
         },
         { status: 500 },
       );
-    } finally {
-      // Clean up uploaded files (optional - files auto-delete after 48 hours)
-      try {
-        await Promise.all(
-          uploadedFiles.map(({ file }) => genAI.files.delete(file.name)),
-        );
-        console.log("🗑️ Uploaded files cleaned up");
-      } catch (cleanupError) {
-        console.warn("⚠️ File cleanup failed (non-critical):", cleanupError);
-      }
     }
 
     const responseText = result.text;
@@ -239,7 +248,7 @@ RESPONSE RULES:
     try {
       parsedResponse = JSON.parse(responseText || "{}");
 
-      if (!parsedResponse.analysis || !parsedResponse.mode) {
+      if (!parsedResponse.mode) {
         throw new Error("Missing required fields in response");
       }
 
@@ -278,6 +287,6 @@ export async function GET() {
     status: "healthy",
     timestamp: new Date().toISOString(),
     model: "gemini-3-flash-preview",
-    method: "File API (parallel upload)",
+    method: "Inline base64 data (no file upload required)",
   });
 }
