@@ -25,7 +25,7 @@ const responseSchema = {
     },
     speak: {
       type: "string",
-      description: "Audio transcription of what the user said",
+      description: "What message should be relayed to the user",
     },
   },
   required: ["mode", "shouldRespond", "transcription", "speak"],
@@ -38,6 +38,39 @@ async function fileToBase64(file: File): Promise<string> {
   return buffer.toString("base64");
 }
 
+// Helper function to get bookmark images from Gemini File API
+async function getBookmarkImages(): Promise<
+  { uri: string; mimeType: string; displayName: string }[]
+> {
+  try {
+    console.log("📋 Fetching bookmark images from Gemini File API...");
+
+    const imageParts: { uri: string; mimeType: string; displayName: string }[] =
+      [];
+
+    const listResponse = await genAI.files.list({ config: { pageSize: 100 } });
+
+    for await (const file of listResponse) {
+      // Only include image files
+      if (file.mimeType?.startsWith("image/")) {
+        imageParts.push({
+          uri: file.uri!,
+          mimeType: file.mimeType,
+          displayName: file.displayName! || file.name!,
+        });
+
+        console.log(`📁 Found: "${file.displayName || file.name}"`);
+      }
+    }
+
+    console.log(`✅ Loaded ${imageParts.length} bookmark images from Gemini`);
+    return imageParts;
+  } catch (error) {
+    console.log("❌ Error fetching files from Gemini:", error);
+    return [];
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -45,8 +78,6 @@ export async function POST(request: NextRequest) {
     const audioFile = formData.get("audio") as File | null;
     const userIntent = formData.get("intent") as string | null;
     const currentMode = formData.get("currentMode") as string | null;
-    console.log(videoFile);
-    console.log(audioFile);
 
     console.log("📥 Received request:", {
       hasVideo: !!videoFile,
@@ -64,6 +95,28 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    console.log("📦 Processing files...");
+    const processingStartTime = Date.now();
+
+    const contentParts: any[] = [];
+
+    // Get bookmark images from Gemini File API
+    const bookmarkImages = await getBookmarkImages();
+
+    // Add bookmark images context to the prompt
+    const bookmarkContext =
+      bookmarkImages.length > 0
+        ? `
+IMPORTANT CONTEXT: You have access to the user's bookmarked images. 
+These images represent important locations, objects, or people in the user's life:
+
+${bookmarkImages.map((img, i) => `${i + 1}. ${img.displayName}`).join("\n")}
+
+Reference these ONLY if relevant to the user's current intent.
+If a user asks about something that might be in the bookmarks, you can mention it.
+`
+        : "";
+
     const systemPrompt = `
 You are a companion assistant for a visually impaired user.
 You are NOT a narrator.
@@ -71,14 +124,11 @@ You are NOT a scene describer.
 You are a calm, helpful presence who assists the user in daily life.
 
 Vision and audio are tools you may use, but they are NEVER the goal.
-Your primary goal is to support the user’s intent, comfort, and safety — just like a human companion would.
+Your primary goal is to support the user's intent, comfort, and safety — just like a human companion would.
 
 Current mode: ${currentMode || "idle"}
 User intent: ${userIntent || "unknown"}
-
-
-
-
+${bookmarkContext}
 ────────────────────────
 RESPONSE FORMAT (STRICT)
 ────────────────────────
@@ -88,8 +138,7 @@ You MUST respond with a JSON object matching this schema exactly:
   "reason": "Short explanation for the chosen mode",
   "shouldRespond": true | false,
   "transcription": "Exact transcription of user speech, or empty string if none",
-      "speak":"What message should be relayed to the user"
-
+  "speak": "What message should be relayed to the user"
 }
 
 ────────────────────────
@@ -99,8 +148,9 @@ PRIMARY DECISION ORDER (VERY IMPORTANT)
 2. Is the user expressing intent, confusion, or need?
 3. Is there an immediate safety risk?
 4. Would visual information meaningfully help right now?
+5. Would reference to bookmarked images help right now?
 
-If vision does not clearly help the user’s intent, DO NOT mention it.
+If vision does not clearly help the user's intent, DO NOT mention it.
 
 ────────────────────────
 SILENCE & FILTERING RULES
@@ -117,11 +167,11 @@ COMPANION BEHAVIOR (WHEN RESPONDING)
 - Acknowledge the user first, not the environment
 - Use vision only to support decisions or safety
 - Never volunteer scene descriptions
-- Never explain what you “see” unless asked or needed
+- Never explain what you "see" unless asked or needed
 
 Examples of correct tone:
-- "Hi, I’m your assistant. How can I help you?"
-- "I’m here with you."
+- "Hi, I'm your assistant. How can I help you?"
+- "I'm here with you."
 - "Let me know if you want help navigating."
 - "For your safety, stop for a moment."
 
@@ -153,48 +203,70 @@ You are a companion first.
 You are not a narrator.
 You speak only when it helps the user.
 `;
-    // Build content parts with inline data
-    console.log("📦 Converting files to base64...");
-    const conversionStartTime = Date.now();
 
-    const contentParts: any[] = [];
+    // Add system prompt as text
+    contentParts.push({ text: systemPrompt });
 
-    if (videoFile && videoFile.size > 0) {
-      console.log("🎥 Converting video to base64...");
-      const videoBase64 = await fileToBase64(videoFile);
-      contentParts.push({
-        inlineData: {
-          mimeType: videoFile.type || "video/webm",
-          data: videoBase64,
-        },
-      });
+    // Add bookmark images as file data parts (from Gemini File API)
+    if (bookmarkImages.length > 0) {
       console.log(
-        `✅ Video converted (${(videoBase64.length / 1024 / 1024).toFixed(2)} MB)`,
+        `📚 Adding ${bookmarkImages.length} bookmark images to content...`,
       );
+
+      for (const image of bookmarkImages) {
+        contentParts.push({
+          fileData: {
+            fileUri: image.uri,
+            mimeType: image.mimeType,
+          },
+        });
+      }
     }
 
+    // Add video as base64 (faster for real-time streams)
+    if (videoFile && videoFile.size > 0) {
+      console.log("🎥 Converting video to base64...");
+      try {
+        const videoBase64 = await fileToBase64(videoFile);
+        contentParts.push({
+          inlineData: {
+            mimeType: videoFile.type || "video/webm",
+            data: videoBase64,
+          },
+        });
+        console.log(
+          `✅ Video converted (${(videoBase64.length / 1024 / 1024).toFixed(2)} MB)`,
+        );
+      } catch (videoError) {
+        console.error("❌ Failed to convert video:", videoError);
+      }
+    }
+
+    // Add audio as base64 (faster for real-time streams)
     if (audioFile && audioFile.size > 0) {
       console.log("🎵 Converting audio to base64...");
-      const audioBase64 = await fileToBase64(audioFile);
-      contentParts.push({
-        inlineData: {
-          mimeType: audioFile.type || "audio/webm",
-          data: audioBase64,
-        },
-      });
-      console.log(
-        `✅ Audio converted (${(audioBase64.length / 1024 / 1024).toFixed(2)} MB)`,
-      );
+      try {
+        const audioBase64 = await fileToBase64(audioFile);
+        contentParts.push({
+          inlineData: {
+            mimeType: audioFile.type || "audio/webm",
+            data: audioBase64,
+          },
+        });
+        console.log(
+          `✅ Audio converted (${(audioBase64.length / 1024 / 1024).toFixed(2)} MB)`,
+        );
+      } catch (audioError) {
+        console.error("❌ Failed to convert audio:", audioError);
+      }
     }
 
     console.log(
-      `✅ All files converted in ${((Date.now() - conversionStartTime) / 1000).toFixed(2)}s`,
+      `✅ All files processed in ${((Date.now() - processingStartTime) / 1000).toFixed(2)}s`,
     );
+    console.log("📝 Total content parts:", contentParts.length);
 
-    contentParts.push({ text: systemPrompt });
-    console.log("📝 Content parts prepared:", contentParts.length);
-
-    // Generate content using inline data
+    // Generate content using Gemini
     let result;
     try {
       console.log("🤖 Generating content with Gemini...");
@@ -262,6 +334,7 @@ You speak only when it helps the user.
         reason: "Fallback due to parse error",
         shouldRespond: true,
         transcription: "",
+        speak: "I'm having trouble processing that. Could you try again?",
       };
     }
 
@@ -287,6 +360,6 @@ export async function GET() {
     status: "healthy",
     timestamp: new Date().toISOString(),
     model: "gemini-3-flash-preview",
-    method: "Inline base64 data (no file upload required)",
+    method: "Hybrid: Base64 for audio/video + File API for bookmarks",
   });
 }

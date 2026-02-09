@@ -6,6 +6,7 @@ import {
   VoiceActivityDetector,
   VoiceActivityEvent,
 } from "@/lib/voice-activity-detector";
+import { Upload, AlertTriangle } from "lucide-react";
 
 const WAVE_BARS = 20;
 const WAVE_MAX_HEIGHT = 60;
@@ -52,6 +53,15 @@ export default function ImprovedIntelligentAnalyzer() {
   const [videoBufferReady, setVideoBufferReady] = useState(false);
   const [sessionId, setSessionId] = useState(0);
   const [retryCount, setRetryCount] = useState(0);
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadedImages, setUploadedImages] = useState<
+    Array<{
+      file: File;
+      description: string;
+    }>
+  >([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderVideoRef = useRef<MediaRecorder | null>(null);
@@ -169,6 +179,106 @@ export default function ImprovedIntelligentAnalyzer() {
       }
     });
   }, []);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+
+    // Filter for image files only
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+
+    if (imageFiles.length === 0) {
+      alert("Please select image files only (JPEG, PNG, etc.)");
+      return;
+    }
+
+    // Check total size (limit to 10MB total)
+    const totalSize = imageFiles.reduce((acc, file) => acc + file.size, 0);
+    const maxSize = 10 * 1024 * 1024; // 10MB
+
+    if (totalSize > maxSize) {
+      alert(
+        "Total file size exceeds 10MB. Please select fewer or smaller images.",
+      );
+      return;
+    }
+
+    // Add files with auto-generated descriptions
+    const newImages = imageFiles.map((file) => {
+      // Auto-generate description from filename
+      const autoDescription = file.name
+        .replace(/\.[^/.]+$/, "") // Remove extension
+        .replace(/[_-]/g, " ") // Replace underscores and hyphens with spaces
+        .replace(/(^\w|\s\w)/g, (m) => m.toUpperCase()) // Capitalize words
+        .trim();
+
+      return {
+        file,
+        description: autoDescription,
+      };
+    });
+
+    setUploadedImages((prev) => [...prev, ...newImages]);
+  };
+
+  const handleImageUpload = useCallback(async () => {
+    if (uploadedImages.length === 0) {
+      alert("Please select images to upload");
+      return;
+    }
+
+    setIsUploading(true);
+    setUploadProgress(0);
+
+    try {
+      const formData = new FormData();
+
+      // Add all selected images with descriptions
+      uploadedImages.forEach((imageData, index) => {
+        const { file, description } = imageData;
+
+        // Clean the filename: replace spaces with underscores, remove special characters
+        const originalName = file.name;
+        const cleanName = originalName
+          .replace(/\s+/g, "_") // Replace spaces with underscores
+          .replace(/[^a-zA-Z0-9_.-]/g, "") // Remove special characters except . _ -
+          .toLowerCase();
+
+        // Create a new File object with the cleaned name
+        const modifiedFile = new File([file], cleanName, { type: file.type });
+
+        formData.append("images", modifiedFile);
+        formData.append("descriptions", description); // Add description as separate field
+
+        console.log(`Uploading: "${cleanName}" - "${description}"`);
+      });
+
+      const response = await fetch("/api/upload-bookmark", {
+        method: "POST",
+        body: formData,
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        alert(
+          `✅ ${result.message}\nTotal bookmarks: ${result.totalBookmarks}`,
+        );
+        setUploadedImages([]);
+        setShowUploadModal(false);
+        setUploadProgress(0);
+        // Refresh bookmark count
+        // fetchBookmarkCount();
+      } else {
+        alert(`❌ Upload failed: ${result.error}`);
+      }
+    } catch (error) {
+      console.error("Upload error:", error);
+      alert("Upload failed. Please try again.");
+    } finally {
+      setIsUploading(false);
+      setUploadProgress(0);
+    }
+  }, [uploadedImages]);
 
   // Start recording with fresh buffers and session ID
   const startRecordingInternal = useCallback(
@@ -927,26 +1037,36 @@ export default function ImprovedIntelligentAnalyzer() {
             {isInitializing ? "Starting..." : "Start Assistant"}
           </button>
         ) : (
-          <div className="flex gap-4">
-            {isRecording ? (
+          <>
+            <div className="flex gap-4">
+              {isRecording ? (
+                <button
+                  onClick={stopRecording}
+                  disabled={isProcessing}
+                  className="flex-1 py-8 text-3xl font-bold bg-red-600 hover:bg-red-700 rounded-3xl disabled:opacity-50"
+                >
+                  Stop
+                </button>
+              ) : (
+                <button
+                  onClick={() =>
+                    streamRef.current &&
+                    startRecordingInternal(streamRef.current)
+                  }
+                  className="flex-1 py-8 text-3xl font-bold bg-green-600 hover:bg-green-700 rounded-3xl"
+                >
+                  Start
+                </button>
+              )}
               <button
-                onClick={stopRecording}
-                disabled={isProcessing}
-                className="flex-1 py-8 text-3xl font-bold bg-red-600 hover:bg-red-700 rounded-3xl disabled:opacity-50"
+                onClick={() => setShowUploadModal(true)}
+                className="px-8 py-4 text-xl font-bold bg-purple-600 hover:bg-purple-700 rounded-3xl flex items-center gap-2"
               >
-                Stop
+                <Upload className="w-6 h-6" />
+                Upload Images
               </button>
-            ) : (
-              <button
-                onClick={() =>
-                  streamRef.current && startRecordingInternal(streamRef.current)
-                }
-                className="flex-1 py-8 text-3xl font-bold bg-green-600 hover:bg-green-700 rounded-3xl"
-              >
-                Start
-              </button>
-            )}
-          </div>
+            </div>
+          </>
         )}
 
         {/* Error Display */}
@@ -978,6 +1098,180 @@ export default function ImprovedIntelligentAnalyzer() {
           </div>
         </div>
       </div>
+
+      {/* Upload Modal */}
+      {/* Upload Modal */}
+      {showUploadModal && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50">
+          <div className="bg-gray-900 rounded-3xl p-8 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-2xl font-bold">Upload Bookmark Images</h2>
+              <button
+                onClick={() => {
+                  setShowUploadModal(false);
+                  setUploadedImages([]);
+                }}
+                className="text-gray-400 hover:text-white text-2xl"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Disclaimer */}
+            <div className="bg-yellow-900/30 border border-yellow-700 rounded-2xl p-4 mb-6">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-6 h-6 text-yellow-400 flex-shrink-0 mt-1" />
+                <div>
+                  <h3 className="font-bold text-yellow-400 mb-1">
+                    ⚠️ Important Note
+                  </h3>
+                  <p className="text-sm text-yellow-300">
+                    For MVP purposes, all uploaded images will be available to
+                    everyone. Please do not upload personal or sensitive files.
+                    All data will be automatically cleared every 48 hours.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* File Input */}
+            <div className="mb-8">
+              <label className="block mb-3 text-gray-300 text-lg">
+                Select images to upload (JPEG, PNG, etc.)
+              </label>
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                onChange={handleFileChange}
+                className="w-full bg-gray-800 border-2 border-gray-700 border-dashed rounded-3xl p-6 text-white file:mr-4 file:py-3 file:px-6 file:rounded-2xl file:border-0 file:text-base file:font-semibold file:bg-purple-600 file:text-white hover:file:bg-purple-700 transition-all cursor-pointer"
+              />
+              <p className="text-gray-400 text-sm mt-3">
+                You can select multiple images at once
+              </p>
+            </div>
+
+            {/* Selected Files with Descriptions */}
+            {uploadedImages.length > 0 && (
+              <div className="mb-8">
+                <h3 className="font-bold text-xl mb-4">
+                  Selected Files ({uploadedImages.length})
+                </h3>
+                <div className="space-y-4 max-h-[40vh] overflow-y-auto pr-2">
+                  {uploadedImages.map((imageData, index) => {
+                    const { file, description } = imageData;
+                    const cleanName = file.name
+                      .replace(/\s+/g, "_")
+                      .replace(/[^a-zA-Z0-9_.-]/g, "")
+                      .toLowerCase();
+
+                    return (
+                      <div key={index} className="bg-gray-800 rounded-2xl p-5">
+                        <div className="flex gap-4">
+                          {/* File Info */}
+                          <div className="flex-shrink-0">
+                            <div className="w-16 h-16 bg-gray-700 rounded-xl flex items-center justify-center">
+                              <div className="text-2xl">📷</div>
+                            </div>
+                          </div>
+
+                          <div className="flex-grow">
+                            <div className="flex justify-between items-start mb-3">
+                              <div>
+                                <div className="font-bold text-lg truncate max-w-md">
+                                  {cleanName}
+                                </div>
+                                <div className="text-gray-400">
+                                  {(file.size / 1024).toFixed(1)} KB •{" "}
+                                  {file.type.split("/")[1].toUpperCase()}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  setUploadedImages((prev) =>
+                                    prev.filter((_, i) => i !== index),
+                                  );
+                                }}
+                                className="text-red-400 hover:text-red-300 text-xl p-2"
+                              >
+                                ✕
+                              </button>
+                            </div>
+
+                            {/* Description Field */}
+                            <div>
+                              <label className="block text-gray-300 mb-2">
+                                Description (for AI context):
+                              </label>
+                              <input
+                                type="text"
+                                value={description}
+                                onChange={(e) => {
+                                  const newImages = [...uploadedImages];
+                                  newImages[index].description = e.target.value;
+                                  setUploadedImages(newImages);
+                                }}
+                                className="w-full bg-gray-900 border border-gray-700 rounded-xl p-3 text-white focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                                placeholder="Enter a description for the AI..."
+                              />
+                              <p className="text-gray-400 text-sm mt-2">
+                                This helps the AI understand what's in the image
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Progress Bar */}
+            {isUploading && (
+              <div className="mb-8">
+                <div className="flex justify-between text-lg mb-3">
+                  <span className="font-bold">Uploading...</span>
+                  <span className="font-bold">{uploadProgress}%</span>
+                </div>
+                <div className="w-full bg-gray-800 rounded-full h-3">
+                  <div
+                    className="bg-gradient-to-r from-purple-600 to-pink-600 h-3 rounded-full transition-all duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Action Buttons */}
+            <div className="flex gap-4">
+              <button
+                onClick={() => {
+                  setShowUploadModal(false);
+                  setUploadedImages([]);
+                }}
+                className="flex-1 py-4 text-xl font-bold bg-gray-800 hover:bg-gray-700 rounded-3xl transition-all"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleImageUpload}
+                disabled={isUploading || uploadedImages.length === 0}
+                className="flex-1 py-4 text-xl font-bold bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 rounded-3xl disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+              >
+                {isUploading ? (
+                  <div className="flex items-center justify-center gap-3">
+                    <Loader2 className="w-6 h-6 animate-spin" />
+                    <span>Uploading...</span>
+                  </div>
+                ) : (
+                  `Upload ${uploadedImages.length} Image${uploadedImages.length !== 1 ? "s" : ""}`
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
